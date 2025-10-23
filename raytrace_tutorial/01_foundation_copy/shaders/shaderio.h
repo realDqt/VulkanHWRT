@@ -28,6 +28,8 @@ NAMESPACE_SHADERIO_BEGIN()
 enum BindingPoints
 {
   eTextures = 0,  // Binding point for textures
+  eOutImage,
+  eTlas,
 };
 
 

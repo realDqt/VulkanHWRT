@@ -82,6 +82,8 @@
 #include "common/utils.hpp"       // Common utilities for the sample application
 #include "common/path_utils.hpp"  // Path utilities for handling resources file paths
 
+#include "_autogen/rtbasic.slang.h"
+
 //---------------------------------------------------------------------------------------
 // Ray Tracing Tutorial
 //
@@ -101,6 +103,397 @@ class RtFoundation : public nvapp::IAppElement
 public:
   RtFoundation()           = default;
   ~RtFoundation() override = default;
+  // --------------helper function begin------------------
+  void primitiveToGeometry(const shaderio::GltfMesh&                 gltfMesh,
+                           VkAccelerationStructureGeometryKHR&       geometry,
+                           VkAccelerationStructureBuildRangeInfoKHR& rangeInfo)
+  {
+    const shaderio::TriangleMesh& triMesh       = gltfMesh.triMesh;
+    const auto                    triangleCount = static_cast<uint32_t>(triMesh.indices.count / 3U);
+
+    VkAccelerationStructureGeometryTrianglesDataKHR triangles{
+        .sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
+        .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
+        .vertexData   = {.deviceAddress = VkDeviceAddress(gltfMesh.gltfBuffer) + triMesh.positions.offset},
+        .vertexStride = triMesh.positions.byteStride,
+        .maxVertex    = triMesh.positions.count - 1,
+        .indexType    = VkIndexType(gltfMesh.indexType),
+        .indexData    = {.deviceAddress = VkDeviceAddress(gltfMesh.gltfBuffer) + triMesh.indices.offset}};
+
+    geometry = VkAccelerationStructureGeometryKHR{.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+                                                  .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+                                                  .geometry     = {.triangles = triangles},
+                                                  .flags = VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR | VK_GEOMETRY_OPAQUE_BIT_KHR};
+
+    rangeInfo = VkAccelerationStructureBuildRangeInfoKHR{.primitiveCount = triangleCount};
+  }
+
+// Generic function to create an acceleration structure (BLAS or TLAS)
+  // Note: This function creates and destroys a scratch buffer for each call.
+  // Not optimal but easier to read and understand. See Helper function for a better approach.
+  void createAccelerationStructure(VkAccelerationStructureTypeKHR asType,  // The type of acceleration structure (BLAS or TLAS)
+                                   nvvk::AccelerationStructure& accelStruct,  // The acceleration structure to create
+                                   VkAccelerationStructureGeometryKHR& asGeometry,  // The geometry to build the acceleration structure from
+                                   VkAccelerationStructureBuildRangeInfoKHR& asBuildRangeInfo,  // The range info for building the acceleration structure
+                                   VkBuildAccelerationStructureFlagsKHR flags  // Build flags (e.g. prefer fast trace)
+  )
+  {
+        VkDevice device = m_app->getDevice();
+
+        // Helper function to align a value to a given alignment
+        auto alignUp = [](auto value, size_t alignment) noexcept { return ((value + alignment - 1) & ~(alignment - 1)); };
+
+        // Fill the build information with the current information, the rest is filled later (scratch buffer and destination AS)
+        VkAccelerationStructureBuildGeometryInfoKHR asBuildInfo{
+            .sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+            .type          = asType,  // The type of acceleration structure (BLAS or TLAS)
+            .flags         = flags,   // Build flags (e.g. prefer fast trace)
+            .mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,  // Build mode vs update
+            .geometryCount = 1,                                               // Deal with one geometry at a time
+            .pGeometries   = &asGeometry,  // The geometry to build the acceleration structure from
+        };
+
+        // One geometry at a time (could be multiple)
+        std::vector<uint32_t> maxPrimCount(1);
+        maxPrimCount[0] = asBuildRangeInfo.primitiveCount;
+
+        // Find the size of the acceleration structure and the scratch buffer
+        VkAccelerationStructureBuildSizesInfoKHR asBuildSize{.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+        vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &asBuildInfo,
+                                                maxPrimCount.data(), &asBuildSize);
+
+        // Make sure the scratch buffer is properly aligned
+        VkDeviceSize scratchSize = alignUp(asBuildSize.buildScratchSize, m_asProperties.minAccelerationStructureScratchOffsetAlignment);
+
+        // Create the scratch buffer to store the temporary data for the build
+        nvvk::Buffer scratchBuffer;
+        NVVK_CHECK(m_allocator.createBuffer(scratchBuffer, scratchSize,
+                                            VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT
+                                                | VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+                                            VMA_MEMORY_USAGE_AUTO, {}, m_asProperties.minAccelerationStructureScratchOffsetAlignment));
+
+        // Create the acceleration structure
+        VkAccelerationStructureCreateInfoKHR createInfo{
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+            .size  = asBuildSize.accelerationStructureSize,  // The size of the acceleration structure
+            .type  = asType,                                 // The type of acceleration structure (BLAS or TLAS)
+        };
+        NVVK_CHECK(m_allocator.createAcceleration(accelStruct, createInfo));
+
+        // Build the acceleration structure
+        {
+          VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+
+          // Fill with new information for the build,scratch buffer and destination AS
+          asBuildInfo.dstAccelerationStructure  = accelStruct.accel;
+          asBuildInfo.scratchData.deviceAddress = scratchBuffer.address;
+
+          VkAccelerationStructureBuildRangeInfoKHR* pBuildRangeInfo = &asBuildRangeInfo;
+          vkCmdBuildAccelerationStructuresKHR(cmd, 1, &asBuildInfo, &pBuildRangeInfo);
+
+          m_app->submitAndWaitTempCmdBuffer(cmd);
+        }
+        // Cleanup the scratch buffer
+        m_allocator.destroyBuffer(scratchBuffer);
+  }
+
+  void createBottomLevelAS()
+  {
+        SCOPED_TIMER(__FUNCTION__);
+
+        // Prepare geometry information for all meshes
+        m_blasAccel.resize(m_sceneResource.meshes.size());
+
+        // One BLAS per primitive
+        for(uint32_t blasId = 0; blasId < m_sceneResource.meshes.size(); blasId++)
+        {
+          VkAccelerationStructureGeometryKHR       asGeometry{};
+          VkAccelerationStructureBuildRangeInfoKHR asBuildRangeInfo{};
+
+          // Convert the primitive information to acceleration structure geometry
+          primitiveToGeometry(m_sceneResource.meshes[blasId], asGeometry, asBuildRangeInfo);
+
+          createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, m_blasAccel[blasId], asGeometry,
+                                      asBuildRangeInfo, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR);
+          NVVK_DBG_NAME(m_blasAccel[blasId].accel);
+        }
+
+        LOGI("  Bottom-level acceleration structures built successfully\n");
+  }
+
+  void createTopLevelAS()
+  {
+        SCOPED_TIMER(__FUNCTION__);
+
+        // VkTransformMatrixKHR is row-major 3x4, glm::mat4 is column-major; transpose before memcpy.
+        auto toTransformMatrixKHR = [](const glm::mat4& m) {
+          VkTransformMatrixKHR t;
+          memcpy(&t, glm::value_ptr(glm::transpose(m)), sizeof(t));
+          return t;
+        };
+
+        // First create the instance data for the TLAS
+        std::vector<VkAccelerationStructureInstanceKHR> tlasInstances;
+        tlasInstances.reserve(m_sceneResource.instances.size());
+        for(const shaderio::GltfInstance& instance : m_sceneResource.instances)
+        {
+          VkAccelerationStructureInstanceKHR asInstance{};
+          asInstance.transform                      = toTransformMatrixKHR(instance.transform);  // Position of the instance
+          asInstance.instanceCustomIndex            = instance.meshIndex;                       // gl_InstanceCustomIndexEXT
+          asInstance.accelerationStructureReference = m_blasAccel[instance.meshIndex].address;  // Address of the BLAS
+          asInstance.instanceShaderBindingTableRecordOffset = 0;  // We will use the same hit group for all objects
+          asInstance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_CULL_DISABLE_BIT_NV;  // No culling - double sided
+          asInstance.mask  = 0xFF;
+          tlasInstances.emplace_back(asInstance);
+        }
+
+        // Then create the buffer with the instance data
+        nvvk::Buffer tlasInstancesBuffer;
+        {
+          VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+
+          // Create the instances buffer and upload the instance data
+          NVVK_CHECK(m_allocator.createBuffer(
+              tlasInstancesBuffer, std::span<VkAccelerationStructureInstanceKHR const>(tlasInstances).size_bytes(),
+              VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT));
+          NVVK_CHECK(m_stagingUploader.appendBuffer(tlasInstancesBuffer, 0,
+                                                    std::span<VkAccelerationStructureInstanceKHR const>(tlasInstances)));
+          NVVK_DBG_NAME(tlasInstancesBuffer.buffer);
+          m_stagingUploader.cmdUploadAppended(cmd);
+          m_app->submitAndWaitTempCmdBuffer(cmd);
+        }
+
+        // Then create the TLAS geometry
+        {
+          VkAccelerationStructureGeometryKHR       asGeometry{};
+          VkAccelerationStructureBuildRangeInfoKHR asBuildRangeInfo{};
+
+          // Convert the instance information to acceleration structure geometry, similar to primitiveToGeometry()
+          VkAccelerationStructureGeometryInstancesDataKHR geometryInstances{.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
+                                                                            .data = {.deviceAddress = tlasInstancesBuffer.address}};
+          asGeometry       = {.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+                              .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR,
+                              .geometry     = {.instances = geometryInstances}};
+          asBuildRangeInfo = {.primitiveCount = static_cast<uint32_t>(m_sceneResource.instances.size())};
+
+          createAccelerationStructure(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, m_tlasAccel, asGeometry,
+                                      asBuildRangeInfo, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR);
+          NVVK_DBG_NAME(m_tlasAccel.accel);
+        }
+
+        LOGI("  Top-level acceleration structures built successfully\n");
+        m_allocator.destroyBuffer(tlasInstancesBuffer);  // Cleanup
+  }
+
+  void createRaytraceDescriptorLayout()
+  { 
+        SCOPED_TIMER(__FUNCTION__);
+        nvvk::DescriptorBindings bindings;
+        bindings.addBinding({
+            .binding = shaderio::BindingPoints::eTlas,
+            .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_ALL});
+
+        bindings.addBinding({.binding        = shaderio::BindingPoints::eOutImage,
+                             .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                             .descriptorCount = 1,
+                             .stageFlags      = VK_SHADER_STAGE_ALL});
+
+        m_rtDescPack.init(bindings, m_app->getDevice(), 0, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
+
+
+        LOGI("Ray tracing descriptor layout created\n");
+  }
+
+  void createRayTracingPipeline()
+  {
+      SCOPED_TIMER(__FUNCTION__);
+
+      vkDestroyPipeline(m_app->getDevice(), m_rtPipeline, nullptr);
+      vkDestroyPipelineLayout(m_app->getDevice(), m_rtPipelineLayout, nullptr);
+
+      enum StageIndices
+      {
+          eRaygen,
+          eMiss,
+          eClosestHit,
+          eShaderGroupCount
+      };
+
+      std::array<VkPipelineShaderStageCreateInfo, eShaderGroupCount> stages{};
+      for(auto& s : stages)
+      {
+        s.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+      }
+
+      VkShaderModuleCreateInfo shaderCode = compileSlangShader("rtbasic.slang", rtbasic_slang);
+      stages[eRaygen].pNext               = &shaderCode;
+      stages[eRaygen].pName               = "rgenMain";
+      stages[eRaygen].stage               = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+      stages[eMiss].pNext               = &shaderCode;
+      stages[eMiss].pName                 = "rmissMain";
+      stages[eMiss].stage                 = VK_SHADER_STAGE_MISS_BIT_KHR;
+      stages[eClosestHit].pNext               = &shaderCode;
+      stages[eClosestHit].pName           = "rchitMain";
+      stages[eClosestHit].stage               = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+
+      // Shader groups
+      VkRayTracingShaderGroupCreateInfoKHR group{VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR};
+      group.anyHitShader = VK_SHADER_UNUSED_KHR;
+      group.closestHitShader = VK_SHADER_UNUSED_KHR;
+      group.generalShader = VK_SHADER_UNUSED_KHR;
+      group.intersectionShader = VK_SHADER_UNUSED_KHR;
+
+      std::vector<VkRayTracingShaderGroupCreateInfoKHR> shader_groups;
+
+      // Ray gen
+      group.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+      group.generalShader = eRaygen;
+      shader_groups.push_back(group);
+
+      // Miss
+      group.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+      group.generalShader = eMiss;
+      shader_groups.push_back(group);
+
+      // closest hit
+      group.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+      group.generalShader = VK_SHADER_UNUSED_KHR;
+      group.closestHitShader = eClosestHit;
+      shader_groups.push_back(group);
+
+      // Push constant
+      const VkPushConstantRange push_constant{VK_SHADER_STAGE_ALL, 0, sizeof(shaderio::TutoPushConstant)};
+
+      VkPipelineLayoutCreateInfo pipeline_layout_create_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+      pipeline_layout_create_info.pushConstantRangeCount = 1;
+      pipeline_layout_create_info.pPushConstantRanges    = &push_constant;
+
+      // Descriptor sets
+      std::array<VkDescriptorSetLayout, 2> layouts = {m_descPack.getLayout(), m_rtDescPack.getLayout()};
+      pipeline_layout_create_info.setLayoutCount = uint32_t(layouts.size());
+      pipeline_layout_create_info.pSetLayouts    = layouts.data();
+      vkCreatePipelineLayout(m_app->getDevice(), &pipeline_layout_create_info, nullptr, &m_rtPipelineLayout);
+      NVVK_DBG_NAME(m_rtPipelineLayout);
+
+      VkRayTracingPipelineCreateInfoKHR rtPipelineInfo{VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+
+      rtPipelineInfo.stageCount = static_cast<uint32_t>(stages.size());
+      rtPipelineInfo.pStages    = stages.data();
+      rtPipelineInfo.groupCount = static_cast<uint32_t>(shader_groups.size());
+      rtPipelineInfo.pGroups    = shader_groups.data();
+      rtPipelineInfo.maxPipelineRayRecursionDepth = std::max(3U, m_rtProperties.maxRayRecursionDepth);
+      rtPipelineInfo.layout                       = m_rtPipelineLayout;
+      vkCreateRayTracingPipelinesKHR(m_app->getDevice(), {}, {}, 1, &rtPipelineInfo, nullptr, &m_rtPipeline);
+      NVVK_DBG_NAME(m_rtPipeline);
+      LOGI("Ray tracing pipeline layout created successfully\n");
+
+      createShaderBindingTable(rtPipelineInfo);
+  }
+
+  void rayTraceScene(VkCommandBuffer cmd) { 
+      NVVK_DBG_SCOPE(cmd);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipeline);
+      const VkBindDescriptorSetsInfo bindDescriptorSetsInfo{
+          .sType = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO,
+          .stageFlags = VK_SHADER_STAGE_ALL,
+          .layout     = m_rtPipelineLayout,
+          .firstSet = 0,
+          .descriptorSetCount = 1,
+          .pDescriptorSets    = m_descPack.getSetPtr()
+      };
+
+      vkCmdBindDescriptorSets2(cmd, &bindDescriptorSetsInfo);
+      nvvk::WriteSetContainer write{};
+      write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eTlas), m_tlasAccel);
+      write.append(m_rtDescPack.makeWrite(shaderio::BindingPoints::eOutImage), m_gBuffers.getColorImageView(eImgRendered), VK_IMAGE_LAYOUT_GENERAL);
+      vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipelineLayout, 1, write.size(), write.data());
+
+      shaderio::TutoPushConstant pushValues{.sceneInfoAddress = (shaderio::GltfSceneInfo*)m_sceneResource.bSceneInfo.address
+      };
+      const VkPushConstantsInfo pushInfo{
+          .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO,
+          .layout = m_rtPipelineLayout,
+          .stageFlags = VK_SHADER_STAGE_ALL,
+          .size       = sizeof(shaderio::TutoPushConstant),
+          .pValues = &pushValues
+      };
+
+      vkCmdPushConstants2(cmd, &pushInfo);
+
+      const VkExtent2D& size = m_app->getViewportSize();
+      vkCmdTraceRaysKHR(cmd, &m_raygenRegion, &m_missRegion, &m_hitRegion, &m_callableRegion, size.width, size.height, 1);
+      nvvk::cmdMemoryBarrier(cmd, VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+  }
+
+  void createShaderBindingTable(const VkRayTracingPipelineCreateInfoKHR& rtPipelineInfo)
+  { 
+      SCOPED_TIMER(__FUNCTION__);
+
+      m_allocator.destroyBuffer(m_sbtBuffer);
+
+      VkDevice device = m_app->getDevice();
+      uint32_t handleSize = m_rtProperties.shaderGroupHandleSize;
+      uint32_t handleAlignment = m_rtProperties.shaderGroupHandleAlignment;
+      uint32_t baseAlignment   = m_rtProperties.shaderGroupBaseAlignment;
+      uint32_t groupCount      = rtPipelineInfo.groupCount;
+
+      // Get shader group handles
+      size_t dataSize = groupCount * handleSize;
+      m_shaderHandles.resize(dataSize);
+      NVVK_CHECK(vkGetRayTracingShaderGroupHandlesKHR(device, m_rtPipeline, 0, groupCount, dataSize, m_shaderHandles.data()));
+
+      // Calculate SBT buffer size with proper alignment
+      auto alignUp = [](uint32_t size, uint32_t alignment) {
+        return (size + alignment - 1) & ~(alignment - 1); };
+      uint32_t raygenSize = alignUp(handleSize, handleAlignment);
+      uint32_t missSize = alignUp(handleSize, handleAlignment);
+      uint32_t hitSize = alignUp(handleSize, handleAlignment);
+      uint32_t callableSize = 0;
+
+      uint32_t raygenOffset = 0;
+      uint32_t missOffset   = alignUp(raygenSize, baseAlignment);
+      uint32_t hitOffset    = alignUp(missOffset + missSize, baseAlignment);
+      uint32_t callableOffset = alignUp(hitOffset + hitSize, baseAlignment);
+      
+      size_t bufferSize = callableOffset + callableSize;
+
+      // Create the SBT buffer
+      NVVK_CHECK(m_allocator.createBuffer(m_sbtBuffer, bufferSize, VK_BUFFER_USAGE_2_SHADER_BINDING_TABLE_BIT_KHR, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 
+                                          VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT));
+
+      NVVK_DBG_NAME(m_sbtBuffer.buffer);
+
+      // Populate SBT buffer
+      uint8_t* pData = static_cast<uint8_t*>(m_sbtBuffer.mapping);
+
+      // Ray generation shader
+      memcpy(pData + raygenOffset, m_shaderHandles.data() + 0 * handleSize, handleSize);
+      m_raygenRegion.deviceAddress = m_sbtBuffer.address + raygenOffset;
+      m_raygenRegion.stride        = raygenSize;
+      m_raygenRegion.size          = raygenSize;
+
+      // Miss shader
+      memcpy(pData + missOffset, m_shaderHandles.data() + 1 * handleSize, handleSize);
+      m_missRegion.deviceAddress = m_sbtBuffer.address + missOffset;
+      m_missRegion.stride        = missSize;
+      m_missRegion.size          = missSize;
+
+      // Hit shader
+      memcpy(pData + hitOffset, m_shaderHandles.data() + 2 * handleSize, handleSize);
+      m_hitRegion.deviceAddress = m_sbtBuffer.address + hitOffset;
+      m_hitRegion.stride        = hitSize;
+      m_hitRegion.size          = hitSize;
+
+      // Callable shaders (not used)
+      m_callableRegion.deviceAddress = 0;
+      m_callableRegion.stride        = 0;
+      m_callableRegion.size          = 0;
+
+      LOGI("Shader binding table created and populated \n");
+  }
+  // --------------helper function end------------------
 
   //-------------------------------------------------------------------------------
   // Create the what is needed
@@ -169,6 +562,11 @@ public:
     m_rtProperties.pNext = &m_asProperties;
     prop2.pNext          = &m_rtProperties;
     vkGetPhysicalDeviceProperties2(m_app->getPhysicalDevice(), &prop2);
+
+    createBottomLevelAS();
+    createTopLevelAS();
+    createRaytraceDescriptorLayout();
+    createRayTracingPipeline();
   }
 
   //-------------------------------------------------------------------------------
@@ -199,11 +597,22 @@ public:
       m_allocator.destroyImage(texture);
     }
 
+
     m_gBuffers.deinit();
     m_stagingUploader.deinit();
     m_skySimple.deinit();
     m_tonemapper.deinit();
     m_samplerPool.deinit();
+
+    vkDestroyPipelineLayout(device, m_rtPipelineLayout, nullptr);
+    vkDestroyPipeline(device, m_rtPipeline, nullptr);
+    m_rtDescPack.deinit();
+    m_allocator.destroyBuffer(m_sbtBuffer);
+    for(auto& blas : m_blasAccel)
+    {
+      m_allocator.destroyAcceleration(blas);
+    }
+    m_allocator.destroyAcceleration(m_tlasAccel);
     m_allocator.deinit();
   }
 
@@ -223,6 +632,7 @@ public:
     // Setting panel
     if(ImGui::Begin("Settings"))
     {
+      ImGui::Checkbox("Use Ray Tracing", &m_useRayTracing);
       if(ImGui::CollapsingHeader("Camera"))
         nvgui::CameraWidget(m_cameraManip);
       if(ImGui::CollapsingHeader("Environment"))
@@ -294,7 +704,14 @@ public:
     // Update the scene information buffer, this cannot be done in between dynamic rendering
     updateSceneBuffer(cmd);
 
-    rasterScene(cmd);
+    if(m_useRayTracing)
+    {
+      rayTraceScene(cmd);
+    }
+    else
+    {
+      rasterScene(cmd);
+    }
 
     postProcess(cmd);
   }
@@ -327,7 +744,15 @@ public:
     if(reload)
     {
       vkQueueWaitIdle(m_app->getQueue(0).queue);
-      compileAndCreateGraphicsShaders();  // Recompile shaders on F5 key press
+      if(m_useRayTracing)
+      {
+        createRayTracingPipeline();
+      }
+      else
+      {
+        compileAndCreateGraphicsShaders();  // Recompile shaders on F5 key press
+      }
+      
     }
   }
 
@@ -560,6 +985,8 @@ public:
     const glm::mat4& projMatrix = m_cameraManip->getPerspectiveMatrix();
 
     m_sceneResource.sceneInfo.viewProjMatrix = projMatrix * viewMatrix;  // Combine the view and projection matrices
+    m_sceneResource.sceneInfo.projInvMatrix  = glm::inverse(projMatrix);
+    m_sceneResource.sceneInfo.viewInvMatrix  = glm::inverse(viewMatrix);
     m_sceneResource.sceneInfo.cameraPosition = m_cameraManip->getEye();  // Get the camera position
     m_sceneResource.sceneInfo.instances = (shaderio::GltfInstance*)m_sceneResource.bInstances.address;  // Get the address of the instance buffer
     m_sceneResource.sceneInfo.meshes = (shaderio::GltfMesh*)m_sceneResource.bMeshes.address;  // Get the address of the mesh buffer
@@ -746,6 +1173,8 @@ private:
   // Ray Tracing Properties
   VkPhysicalDeviceRayTracingPipelinePropertiesKHR m_rtProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR};
   VkPhysicalDeviceAccelerationStructurePropertiesKHR m_asProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+
+  bool m_useRayTracing = true;
 };
 
 
