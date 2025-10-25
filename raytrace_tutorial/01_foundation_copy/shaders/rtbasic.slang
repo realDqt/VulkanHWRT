@@ -180,12 +180,12 @@ void rchitMain(inout HitPayload payload, in BuiltInTriangleIntersectionAttribute
 
     float3 N = normalize(worldNormal);
     float3 V = -WorldRayDirection();
-    float3 L = normalize(sceneInfo.punctualLights[0].direction);
+    float3 L = normalize(light.direction);
 
     float shadowFactor = testShadows(worldPos, N, light.direction, light);
 
     float3 color = pbrMetallicRoughness(albedo, metallic, roughness, N, V, L);
-    color *= sceneInfo.punctualLights[0].color * sceneInfo.punctualLights[0].intensity * shadowFactor;
+    color *= light.color * light.intensity * shadowFactor;
 
     payload.color = color;
 }
